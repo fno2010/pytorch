@@ -1536,6 +1536,40 @@ if(USE_CUDA)
   target_link_libraries(torch_cuda PUBLIC torch_cpu_library ${Caffe2_PUBLIC_CUDA_DEPENDENCY_LIBS})
 endif()
 
+# ---[ Flash Attention.
+if(USE_FLASH_ATTENTION)
+  add_library(pytorch_flash STATIC ${FLASH_ATTENTION_SRCS} )
+  target_include_directories(pytorch_flash PRIVATE ${FLASH_ATTENTION_INCLUDE})
+
+  torch_cuda_get_nvcc_gencode_flag(EXISTING_ARCH_FLAGS)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0 AND
+    EXISTING_ARCH_FLAGS MATCHES ".*compute_90.*")
+    set_source_files_properties(${FLASH_ATTENTION_CU}
+      PROPERTIES COMPILE_FLAGS "-gencode arch=compute_90a,code=sm_90a")
+  endif()
+
+  torch_compile_options(pytorch_flash)  # see cmake/public/utils.cmake
+  target_compile_options_if_supported(pytorch_flash "-Wno-deprecated-copy")  # see cmake/public/utils.cmake
+  target_compile_definitions(pytorch_flash PRIVATE USE_CUDA)
+  target_compile_definitions(pytorch_flash PRIVATE USE_FLASH_ATTENTION)
+  if(USE_DISTRIBUTED)
+    if(USE_UCC AND USE_C10D_UCC)
+      if(USE_CUDA)
+        target_compile_definitions(pytorch_flash PUBLIC USE_C10D_UCC)
+      endif()
+    endif()
+    if(USE_NCCL AND USE_C10D_NCCL)
+      target_compile_definitions(pytorch_flash PUBLIC USE_C10D_NCCL)
+    endif()
+  endif()
+  if(USE_CUDA)
+    target_compile_definitions(pytorch_flash PRIVATE TORCH_CUDA_BUILD_MAIN_LIB)
+  endif()
+
+  # Link flash attention
+  target_link_libraries(torch_cuda PRIVATE pytorch_flash)
+endif()
+
 # ---[ XPU library.
 if(USE_XPU)
   target_link_libraries(torch_xpu INTERFACE torch::xpurt)

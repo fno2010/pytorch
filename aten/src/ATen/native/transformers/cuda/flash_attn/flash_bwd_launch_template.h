@@ -1,338 +1,208 @@
 /******************************************************************************
- * Copyright (c) 2024, Tri Dao.
+ * Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
  ******************************************************************************/
 
 #pragma once
 
-#include <c10/cuda/CUDAException.h>
+#include "cute/tensor.hpp"
+
+#include "cutlass/cluster_launch.hpp"
+#include "cutlass/device_kernel.h"  // For device_kernel
 
 #include <ATen/native/transformers/cuda/flash_attn/static_switch.h>
 #include <ATen/native/transformers/cuda/flash_attn/flash.h>
 #include <ATen/native/transformers/cuda/flash_attn/flash_bwd_preprocess_kernel.h>
+#include <ATen/native/transformers/cuda/flash_attn/flash_bwd_postprocess_kernel.h>
+#include <ATen/native/transformers/cuda/flash_attn/flash_bwd_kernel.h>
+#include <ATen/native/transformers/cuda/flash_attn/mainloop_bwd_sm90_tma_gmma_ws.hpp>
+#include <ATen/native/transformers/cuda/flash_attn/epilogue_bwd_sm90_tma.hpp>
 #include <ATen/native/transformers/cuda/flash_attn/flash_bwd_kernel.h>
 
 namespace pytorch_flash {
 
-// Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-#define ARCH_SUPPORTS_FLASH
-#endif
+using namespace cute;
 
-#if defined(ARCH_SUPPORTS_FLASH) && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 11 && \
-    defined(__CUDACC_VER_MINOR__) && __CUDACC_VER_MINOR__ >= 8
-#define KERNEL_PARAM_MODIFIER __grid_constant__
-#else
-#define KERNEL_PARAM_MODIFIER
-#endif
-
-// Define a macro for unsupported architecture handling to centralize the error message
-#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm80-sm90, but was built for < 8.0!");
-
-// Use a macro to clean up kernel definitions
-#define DEFINE_FLASH_BACKWARD_KERNEL(kernelName, ...) \
-template<typename Kernel_traits, __VA_ARGS__> \
-__global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_bwd_params params)
-
-DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_kernel, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_M, bool Is_even_K) {
-    #if defined(ARCH_SUPPORTS_FLASH)
-       pytorch_flash::compute_dq_dk_dv<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K>(params);
-    #else
-        FLASH_UNSUPPORTED_ARCH
-    #endif
-}
-
-DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K) {
-    #if defined(ARCH_SUPPORTS_FLASH)
-        static_assert(!(Is_causal && Is_local));  // If Is_local is true, Is_causal should be false
-        pytorch_flash::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K>(params);
-    #else
-        FLASH_UNSUPPORTED_ARCH
-    #endif
-}
-
-template<bool Clear_dQaccum=true, typename Kernel_traits>
-__global__ void flash_bwd_dot_do_o_kernel(const Flash_bwd_params params) {
-    pytorch_flash::compute_dot_do_o<Clear_dQaccum, Kernel_traits>(params);
-}
-
-template<typename Kernel_traits>
-__global__ void flash_bwd_clear_dkvaccum_kernel(const Flash_bwd_params params) {
-    pytorch_flash::clear_dKVaccum<Kernel_traits>(params);
-}
-
-template<typename Kernel_traits>
-__global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const int nsplits) {
-    pytorch_flash::convert_dQ<Kernel_traits>(params, nsplits);
-}
-
-template<typename Kernel_traits>
-__global__ void flash_bwd_convert_dkv_kernel(const Flash_bwd_params params) {
-    pytorch_flash::convert_dKV<Kernel_traits>(params);
-}
-
-template<typename Kernel_traits, bool Is_dropout>
-void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) {
-    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-    dim3 grid_m(num_m_block, params.b, params.h);
-    const int num_n_block = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
-    int gridDimx = num_n_block;
-    if (params.deterministic) {
-        auto dprops = at::cuda::getCurrentDeviceProperties();
-        gridDimx = (dprops->multiProcessorCount + params.b * params.h - 1) / (params.b * params.h);
-    }
-    dim3 grid_n(gridDimx, params.b, params.h);
-
-    if (!params.deterministic) {
-        flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
-    } else {
-        flash_bwd_dot_do_o_kernel<false, Kernel_traits><<<grid_m, Kernel_traits::kNThreads, 0, stream>>>(params);
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    // We want to specialize to is_even_MN and not just is_even_M, since in the case where N is not
-    // a multiple of kBlockN, we'll need to apply mask in the loop.
-    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_q % Kernel_traits::kBlockM == 0 && params.seqlen_k % Kernel_traits::kBlockN == 0;
-    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
-    constexpr int smem_size_dq_dk_dv = Kernel_traits::kSmemSize1colblock;
-    // printf("smem_size_dq_dk_dv = %d\n", smem_size_dq_dk_dv);
-    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
-            EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
-                LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !params.is_causal, Is_local, [&] {
-                    ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
-                        // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                        // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
-                        // If Is_local, set Is_causal to false
-                        auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && Kernel_traits::kHeadDim <= 128, IsEvenKConst>;
-                        // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, false, Is_causal, false, false, true, true>;
-                        if (smem_size_dq_dk_dv >= 48 * 1024)  {
-                            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
-                        }
-                        kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
-                        C10_CUDA_KERNEL_LAUNCH_CHECK();
-                    });
-                });
-            });
-        });
-    });
-
-    auto kernel_dq = &flash_bwd_convert_dq_kernel<Kernel_traits>;
-    if (Kernel_traits::kSmemdQSize >= 48 * 1024)  {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
-    }
-    kernel_dq<<<grid_m, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(params, !params.deterministic ? 1 : gridDimx);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-template<typename Kernel_traits, bool Is_dropout>
+template <int kHeadDim, int kBlockM, int kBlockN, typename Element, bool Is_causal, bool Varlen, bool Deterministic,
+          bool dKV_swapAB, bool dQ_swapAB, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1>
 void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-#ifndef FLASHATTENTION_DISABLE_BACKWARD
-    run_flash_bwd_seqk_parallel<Kernel_traits, Is_dropout>(params, stream);
-#endif
-}
+    using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
+    using ElementAccum = float;
+    using PreprocessKernel = pytorch_flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90, /*Clear_dQaccum=*/true, Varlen>;
+    int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * 128, 128);
+    typename PreprocessKernel::Arguments preprocess_args {
+        static_cast<Element const*>(params.o_ptr),
+        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_O
+        {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
+        static_cast<Element const*>(params.do_ptr),
+        {params.do_row_stride, _1{}, params.do_head_stride, !Varlen ? params.do_batch_stride : 0},  // stride_dO
+        static_cast<float*>(params.dsoftmax_sum),
+        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.h, !Varlen ? params.b : 1},  // shape_dPsum
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+        static_cast<float*>(params.softmax_lse_ptr),
+        {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
+        static_cast<float*>(params.softmax_lse_log2_ptr),
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        static_cast<ElementAccum*>(params.dq_accum_ptr),
+        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.d_rounded, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {params.d_rounded, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0},  // stride_dQ
+        params.b,
+        params.dq_semaphore,
+        params.cu_seqlens_q,
+        params.seqused_q
+    };
+    typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
+    int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
+    dim3 grid_m(num_m_block, params.h, params.b);
+    cutlass::device_kernel<PreprocessKernel><<<grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream>>>(preprocess_params);
 
-template<typename T>
-void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream) {
-    constexpr static int Headdim = 32;
+    using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
+    using ClusterShape = cute::Shape<_1, Int<1>, _1>;
+    static constexpr int Stages = 2;
+    using CollectiveMainloop = pytorch_flash::CollectiveMainloopBwd<Stages, ClusterShape, TileShape_MNK, Element, ElementAccum, cutlass::arch::Sm90,
+            Is_causal, Varlen, Deterministic,
+            dKV_swapAB, dQ_swapAB, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>;
+    using CollectiveEpilogue = pytorch_flash::CollectiveEpilogueBwd<TileShape_MNK, Element, CollectiveMainloop::NumMmaThreads, Varlen>;
+    using Scheduler = pytorch_flash::SingleTileSchedulerBwd;
+    using AttnKernel = pytorch_flash::FlashAttnBwd<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
+
+    typename CollectiveMainloop::Arguments mainloop_args {
+        static_cast<Element const*>(params.q_ptr),
+        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_Q
+        {params.q_row_stride, _1{}, params.q_head_stride, !Varlen ? params.q_batch_stride : 0},  // stride_Q
+        static_cast<Element const*>(params.k_ptr),
+        {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h_k, !Varlen ? params.b : 1},  // shape_K
+        {params.k_row_stride, _1{}, params.k_head_stride, !Varlen ? params.k_batch_stride : 0},  // stride_K
+        static_cast<Element const*>(params.v_ptr),
+        {params.v_row_stride, _1{}, params.v_head_stride, !Varlen ? params.v_batch_stride : 0},  // stride_V
+        static_cast<Element const*>(params.do_ptr),
+        {params.do_row_stride, _1{}, params.do_head_stride, !Varlen ? params.do_batch_stride : 0},  // stride_dO
+        static_cast<ElementAccum*>(params.dq_accum_ptr),
+        // {params.seqlen_q_rounded, params.d_rounded, params.h, params.b},  // shape_dQaccum
+        // {params.d_rounded, _1{}, params.d_rounded * params.seqlen_q_rounded, params.d_rounded * params.seqlen_q_rounded * params.h}, // stride_dQaccum
+        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * (params.d_rounded / 32), 32, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {32, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        static_cast<float*>(params.softmax_lse_log2_ptr),
+        {!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, params.h, !Varlen ? params.b : 1},  // shape_LSE
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_LSE_log2
+        static_cast<float*>(params.dsoftmax_sum),
+        {_1{}, !Varlen ? params.seqlen_q_rounded : total_q_padded_rounded, !Varlen ? params.h * params.seqlen_q_rounded : 0},  // stride_dPsum
+        params.scale_softmax,
+        params.b,
+        params.dq_semaphore,
+        params.cu_seqlens_q, params.cu_seqlens_k,
+        params.seqused_q, params.seqused_k
+    };
+    typename CollectiveEpilogue::Arguments epilogue_args {
+        static_cast<Element*>(params.dk_ptr),
+        {!Varlen ? params.seqlen_k : params.total_k, params.d, params.h, !Varlen ? params.b : 1},  // shape_dK
+        {params.dk_row_stride, _1{}, params.dk_head_stride, !Varlen ? params.dk_batch_stride : 0},  // stride_dK
+        static_cast<Element*>(params.dv_ptr),
+        {params.dv_row_stride, _1{}, params.dv_head_stride, !Varlen ? params.dv_batch_stride : 0},
+        params.cu_seqlens_k
+    };
+
+    int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));
+    num_blocks_n = cutlass::round_up(num_blocks_n, size<1>(ClusterShape{}));
+    typename Scheduler::Arguments scheduler_args {
+        num_blocks_n, params.h, params.b, params.tile_count_semaphore, params.cu_seqlens_k
+    };
+
     int device;
     cudaGetDevice(&device);
-    int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) { // 104 KB
-            if constexpr(!Is_dropout) {  // We can afford more registers to keep V in registers
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream);
-            } else {
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
-            }
-        } else {  // 96 KB
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream);
-        }
+    typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
+        mainloop_args, epilogue_args, {device}, scheduler_args
     });
+
+    // Get the ptr to kernel function.
+    void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
+    int smem_size = AttnKernel::SharedStorageSize;
+    // int smem_size_q = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_q));
+    // int smem_size_do = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_do));
+    // int smem_size_ds = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_ds));
+    // int smem_size_dqacc = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_dqacc));
+    // int smem_size_k = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_k));
+    // int smem_size_v = sizeof(decltype((typename AttnKernel::SharedStorage{}).mainloop.smem_v));
+    // printf("smem_size = %d, q = %d, k = %d, v = %d, do = %d, ds = %d, dqacc = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v, smem_size_do, smem_size_ds, smem_size_dqacc);
+    if (smem_size >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+
+    dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+    dim3 block_dims = AttnKernel::get_block_shape();
+    dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
+    cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
+    cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+
+    using PostprocessKernel = pytorch_flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, cutlass::arch::Sm90,
+        AttnKernel::CollectiveMainloop::kNThreadsdQ,
+        typename AttnKernel::CollectiveMainloop::SmemLayoutdQaccumTMA,
+        typename AttnKernel::CollectiveMainloop::TiledMmadQ,
+        AttnKernel::CollectiveMainloop::dQ_swapAB
+        >;
+    typename PostprocessKernel::Arguments postprocess_args {
+        static_cast<ElementAccum const*>(params.dq_accum_ptr),
+        // {params.seqlen_q_rounded, params.d_rounded, params.h, params.b},  // shape_dQaccum
+        // {params.d_rounded, _1{}, params.d_rounded * params.seqlen_q_rounded, params.d_rounded * params.seqlen_q_rounded * params.h},  // stride_dQaccum
+        {(!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded) * (params.d_rounded / 32), 32, params.h, !Varlen ? params.b : 1},  // shape_dQaccum
+        {32, _1{}, params.d_rounded * (!Varlen ? params.seqlen_q_rounded : total_q_padded_rounded), !Varlen ? params.d_rounded * params.seqlen_q_rounded * params.h : 0}, // stride_dQaccum
+        static_cast<Element*>(params.dq_ptr),
+        {!Varlen ? params.seqlen_q : params.total_q, params.d, params.h, !Varlen ? params.b : 1},  // shape_dQ
+        {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
+        params.scale_softmax,
+        params.cu_seqlens_q,
+        params.seqused_q
+    };
+    typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
+    int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
+    dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
+    // Get the ptr to kernel function.
+    auto postprocess_kernel = cutlass::device_kernel<PostprocessKernel>;
+    int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
+    if (smem_size_postprocess >= 48 * 1024) {
+        CHECK_CUDA(cudaFuncSetAttribute(postprocess_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    }
+    postprocess_kernel<<<grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream>>>(postprocess_params);
+    CHECK_CUDA_KERNEL_LAUNCH();
+
 }
+
 
 template<typename T>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
-    int device;
-    cudaGetDevice(&device);
-    int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    // printf("max_smem_per_block = %d\n", max_smem_per_block);
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // Changing AtomLayoutMdQ from 2 to 4 takes the same time
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>>(params, stream);
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, true, false, T>>(params, stream);
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 2, 4, 4, false, false, T>>(params, stream);
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_dropout>(params, stream);
-        // This is slightly faster. We want to split M more so we need fewer registers to store LSE.
-        if (max_smem_per_block >= 144 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
-            // This has a lot of register spilling
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout>(params, stream);
-        } else {
-            // if (params.h == params.h_k) {
-                // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout>(params, stream);
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout>(params, stream);
-                // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, false, false, T>, Is_dropout>(params, stream);
-                // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, true, false, T>, Is_dropout>(params, stream);
-            // } else {
-            // }
-        }
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                run_flash_bwd<Headdim, 128, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 2>(params, stream);
+            });
+        });
     });
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 4, true, false, T>>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 4, 2, 2, 2, true, false, T>>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 128, 4, 1, 4, 1, false, false, T>>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 16, 128, 4, 1, 4, 1, false, false, T>>(params, stream);
-    // M=128, N=64 is quite slow, I think because we need to read/write dQaccum twice as many times
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 2, 2, 2, false, T>>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, false, T>>(params, stream);
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 4, false, T>>(params, stream);
-
-    // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 4, 4, 2, 4, false, false, T>>(params, stream);
 }
 
 template<typename T>
 void run_mha_bwd_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
-    int device;
-    cudaGetDevice(&device);
-    int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    // printf("max_smem_per_block = %d\n", max_smem_per_block);
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 116 * 1024) {
-            if constexpr(!Is_dropout) {  // 92KB
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout>(params, stream);
-            } else {  // 116 KB
-                // This is faster for dropout since we don't have many registers to spare
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout>(params, stream);
-            }
-        } else {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout>(params, stream);
-        }
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                run_flash_bwd<Headdim, 64, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+            });
+        });
     });
 }
 
 template<typename T>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
-    int device;
-    cudaGetDevice(&device);
-    int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    // printf("max_smem_per_block = %d\n", max_smem_per_block);
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 128, 8, 2, 2, 2, false, false, T>>(params, stream);
-        // This is faster, in the case of sequence-parallel bwd (where we need fewer registers).
-        // Out of these three, the 2nd one is slightly faster (2% faster than the first). Idk why.
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 2, 2, false, false, T>>(params, stream);
-        if (max_smem_per_block >= 144 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_dropout>(params, stream);
-            // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
-            // run_flash_bwd_seqk_parallel<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, true, T>, Is_dropout>(params, stream);
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, true, false, T>, Is_dropout>(params, stream);
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 2, 2, true, false, T>, Is_dropout>(params, stream);
-        } else {
-            // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, false, T>, Is_dropout>(params, stream);
-        }
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>>(params, stream);
-
-        // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 8, 4, 4, 4, false, false, T>>(params, stream);
-    });
-}
-
-template<typename T>
-void run_mha_bwd_hdim160(Flash_bwd_params &params, cudaStream_t stream) {
-    constexpr static int Headdim = 160;
-    int device;
-    cudaGetDevice(&device);
-    int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 116 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
-        } else {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, true, T>, Is_dropout>(params, stream);
-        }
-    });
-}
-
-template<typename T>
-void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
-    constexpr static int Headdim = 192;
-    int device;
-    cudaGetDevice(&device);
-    int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 136 * 1024) {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
-        } else {
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, true, T>, Is_dropout>(params, stream);
-        }
-    });
-}
-
-template<typename T>
-void run_mha_bwd_hdim224(Flash_bwd_params &params, cudaStream_t stream) {
-    constexpr static int Headdim = 224;
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 4, 4, false, false, T>, Is_dropout>(params, stream);
-    });
-}
-
-template<typename T>
-void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
-    constexpr static int Headdim = 256;
-    int device;
-    cudaGetDevice(&device);
-    int max_smem_per_block;
-    cudaError status_ = cudaDeviceGetAttribute(
-        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
-    }
-    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 176 * 1024) {  // H100
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
-        } else if (max_smem_per_block >= 144 * 1024) {  // A100, we don't do double buffering to save smem
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, true, T>, Is_dropout>(params, stream);
-        } else { // sm86 and sm89, max smem is 99 KB. Only works without dropout. V in regs and no double buffering.
-            if constexpr (!Is_dropout) {
-                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 32, 8, 4, 1, 2, true, true, T>, false>(params, stream);
-            }
-        }
+    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+        BOOL_SWITCH(params.cu_seqlens_q != nullptr || params.cu_seqlens_k != nullptr, Varlen, [&] {
+            BOOL_SWITCH(params.deterministic, Deterministic, [&] {
+                run_flash_bwd<Headdim, 64, 128, T, Is_causal, Varlen, Deterministic, false, false, 1, 2, 1>(params, stream);
+            });
+        });
     });
 }
 
 
-}; // namespace pytorch_flash
+}; // namespace pytorch_fmha

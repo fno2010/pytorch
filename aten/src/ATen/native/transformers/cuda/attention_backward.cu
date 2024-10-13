@@ -111,7 +111,31 @@ std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
   // in order to determine whether we are using varlen or dense forward
   if (cumulative_sequence_length_q.defined()) {
     // Varlen forward
-    auto [dQuery, dKey, dValue, dSoftmax] = pytorch_flash::mha_varlen_bwd(
+    // auto [dQuery, dKey, dValue, dSoftmax] = pytorch_flash::mha_varlen_bwd(
+        // contiguous_grad_out,
+        // query,
+        // key,
+        // value,
+        // contiguous_out,
+        // logsumexp,
+        // dq,
+        // dk,
+        // dv,
+        // cumulative_sequence_length_q,
+        // cumulative_sequence_length_k,
+        // alibi_slopes,
+        // max_seqlen_batch_q,
+        // max_seqlen_batch_k,
+        // dropout_p,
+        // softmax_scale,
+        // false [>zero_tensors<],
+        // is_causal,
+        // non_null_window_left,
+        // non_null_window_right,
+        // determinisitic,
+        // philox_seed,
+        // philox_offset);
+    auto [dQuery, dKey, dValue, dSoftmax, dQueryAccum, softmaxLseLog2] = pytorch_flash::mha_varlen_bwd(
         contiguous_grad_out,
         query,
         key,
@@ -123,22 +147,37 @@ std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
         dv,
         cumulative_sequence_length_q,
         cumulative_sequence_length_k,
-        alibi_slopes,
+        seqused_q,
+        seqused_k,
         max_seqlen_batch_q,
         max_seqlen_batch_k,
-        dropout_p,
         softmax_scale,
-        false /*zero_tensors*/,
         is_causal,
-        non_null_window_left,
-        non_null_window_right,
-        determinisitic,
         philox_seed,
         philox_offset);
     return std::make_tuple(std::move(dQuery), std::move(dKey), std::move(dValue));
   } else {
     // Dense forward
-    auto [dQuery, dKey, dValue, dSoftmax] = pytorch_flash::mha_bwd(
+    // auto [dQuery, dKey, dValue, dSoftmax] = pytorch_flash::mha_bwd(
+        // contiguous_grad_out,
+        // query,
+        // key,
+        // value,
+        // contiguous_out,
+        // logsumexp,
+        // dq,
+        // dk,
+        // dv,
+        // alibi_slopes,
+        // dropout_p,
+        // softmax_scale,
+        // is_causal,
+        // non_null_window_left,
+        // non_null_window_right,
+        // determinisitic,
+        // philox_seed,
+        // philox_offset);
+    auto [dQuery, dKey, dValue, dSoftmax, dQueryAccum] = pytorch_flash::mha_bwd(
         contiguous_grad_out,
         query,
         key,
@@ -148,13 +187,8 @@ std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
         dq,
         dk,
         dv,
-        alibi_slopes,
-        dropout_p,
         softmax_scale,
         is_causal,
-        non_null_window_left,
-        non_null_window_right,
-        determinisitic,
         philox_seed,
         philox_offset);
     return std::make_tuple(std::move(dQuery), std::move(dKey), std::move(dValue));
