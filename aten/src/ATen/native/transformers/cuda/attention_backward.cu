@@ -26,9 +26,12 @@
 #else
 #include <ATen/ops/_flash_attention_backward.h>
 #include <ATen/ops/_flash_attention_backward_native.h>
+#include <ATen/ops/_flash_attention_hopper_backward.h>
+#include <ATen/ops/_flash_attention_hopper_backward_native.h>
 #include <ATen/ops/_efficient_attention_backward.h>
 #include <ATen/ops/_efficient_attention_backward_native.h>
 #include <ATen/ops/_scaled_dot_product_flash_attention_backward_native.h>
+#include <ATen/ops/_scaled_dot_product_flash_attention_hopper_backward_native.h>
 #endif
 
 #ifdef USE_FLASH_ATTENTION
@@ -157,6 +160,111 @@ std::tuple<Tensor, Tensor, Tensor> _flash_attention_backward(
         determinisitic,
         philox_seed,
         philox_offset);
+    return std::make_tuple(std::move(dQuery), std::move(dKey), std::move(dValue));
+  }
+#endif
+  TORCH_CHECK(false, "USE_FLASH_ATTENTION was not enabled for build.");
+  return std::make_tuple(Tensor(), Tensor(), Tensor());
+}
+
+std::tuple<Tensor, Tensor, Tensor> _flash_attention_hopper_backward(
+    const Tensor& grad_out,
+    const Tensor& query,
+    const Tensor& key,
+    const Tensor& value,
+    const Tensor& out,
+    const Tensor& logsumexp,
+    const Tensor& cumulative_sequence_length_q,
+    const Tensor& cumulative_sequence_length_k,
+    int64_t max_seqlen_batch_q,
+    int64_t max_seqlen_batch_k,
+    double dropout_p,
+    bool is_causal,
+    std::optional<double> scale,
+    std::optional<float> softcap,
+    std::optional<int64_t> window_size_left,
+    std::optional<int64_t> window_size_right) {
+#if defined(USE_FLASH_ATTENTION_HOPPER)
+  const auto softmax_scale = sdp::calculate_scale(query, scale).as_float_unchecked();
+  //  CUDA code assumes that dout is contiguous
+  auto contiguous_grad_out = grad_out.contiguous();
+  auto contiguous_out = out.contiguous();
+
+  const int non_null_window_left = window_size_left.has_value() ? window_size_left.value() : -1;
+  const int non_null_window_right = window_size_right.has_value() ? window_size_right.value() : -1;
+  const float non_null_softcap = softcap.has_value() ? softcap.value() : 0.0f;
+
+  std::optional<at::Tensor> dq{std::nullopt};
+  std::optional<at::Tensor> dk{std::nullopt};
+  std::optional<at::Tensor> dv{std::nullopt};
+
+  //  The kernel computes irregardless we will drop for this functions return
+  Tensor grad_softmax;
+
+  // Currently unused args:
+  std::optional<at::Tensor> alibi_slopes{std::nullopt};
+
+  bool determinisitic{false};
+  auto& ctx = at::globalContext();
+  if (ctx.deterministicAlgorithms()) {
+    if (ctx.deterministicAlgorithmsWarnOnly()) {
+      TORCH_WARN_ONCE(
+          "Flash Attention Hopper defaults to a non-deterministic algorithm. ",
+          "To explicitly enable determinism call torch.use_deterministic_algorithms(True, warn_only=False).");
+    } else {
+      determinisitic = true;
+    }
+  }
+
+  // We check the whether the cumulative_sequence_length_q is defined
+  // in order to determine whether we are using varlen or dense forward
+  if (cumulative_sequence_length_q.defined()) {
+    // Varlen forward
+    auto [dQuery, dKey, dValue, dSoftmax, dQueryAccum, softmaxLseLog2] = pytorch_flash::mha_varlen_bwd(
+        contiguous_grad_out,
+        query,
+        key,
+        value,
+        contiguous_out,
+        logsumexp,
+        dq,
+        dk,
+        dv,
+        cumulative_sequence_length_q,
+        cumulative_sequence_length_k,
+        max_seqlen_batch_q,
+        max_seqlen_batch_k,
+        softmax_scale,
+        is_causal,
+        non_null_window_left,
+        non_null_window_right,
+        non_null_softcap,
+        determinisitic);
+    return std::make_tuple(std::move(dQuery), std::move(dKey), std::move(dValue));
+  } else {
+    // Dense forward
+    auto [dQuery,
+          dKey,
+          dValue,
+          dSoftmax,
+          dQueryAccum,
+          dKeyAccum,
+          dValueAccum] = pytorch_flash::mha_bwd(
+        contiguous_grad_out,
+        query,
+        key,
+        value,
+        contiguous_out,
+        logsumexp,
+        dq,
+        dk,
+        dv,
+        softmax_scale,
+        is_causal,
+        non_null_window_left,
+        non_null_window_right,
+        non_null_softcap,
+        determinisitic);
     return std::make_tuple(std::move(dQuery), std::move(dKey), std::move(dValue));
   }
 #endif
@@ -772,6 +880,54 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_flash_attenti
     philox_seed,
     philox_offset,
     scale);
+
+  grad_q = grad_q.transpose(1,2);
+  grad_k = grad_k.transpose(1,2);
+  grad_v = grad_v.transpose(1,2);
+
+  return std::make_tuple(std::move(grad_q), std::move(grad_k), std::move(grad_v));
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> _scaled_dot_product_flash_attention_hopper_backward_cuda(
+    const at::Tensor& grad_out_,
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& out,
+    const at::Tensor& logsumexp,
+    const Tensor& cumulative_sequence_length_q,
+    const Tensor& cumulative_sequence_length_k,
+    const int64_t max_seqlen_batch_q,
+    const int64_t max_seqlen_batch_k,
+    double dropout_p,
+    bool is_causal,
+    std::optional<double> scale,
+    std::optional<float> softcap){
+  if (!grad_out_.defined()) {
+    return std::make_tuple(Tensor{}, Tensor{}, Tensor{});
+  }
+
+  Tensor q_t = query.transpose(1, 2);
+  Tensor k_t = key.transpose(1, 2);
+  Tensor v_t = value.transpose(1, 2);
+
+  Tensor grad_out_t = grad_out_.transpose(1,2);
+  Tensor out_t = out.transpose(1,2);
+
+  auto [grad_q, grad_k, grad_v] = at::_flash_attention_hopper_backward(
+    grad_out_t,
+    q_t,
+    k_t,
+    v_t,
+    out_t,
+    logsumexp,
+    cumulative_sequence_length_q,
+    cumulative_sequence_length_k,
+    max_seqlen_batch_q,
+    max_seqlen_batch_k,
+    is_causal,
+    scale,
+    softcap);
 
   grad_q = grad_q.transpose(1,2);
   grad_k = grad_k.transpose(1,2);

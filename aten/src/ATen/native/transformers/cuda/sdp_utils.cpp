@@ -64,9 +64,10 @@ bool check_prefer_cudnn_attention() {
 #endif
 }
 
-// flash_attention V2 is universally faster than efficient_attention and Math
+// flash_attention V3 > flash_attention V2 > efficient_attention > Math
 std::array<SDPBackend, num_backends> priority_order(sdp_params const& params) {
   constexpr std::array<SDPBackend, num_backends> default_order{
+      SDPBackend::flash_attention_hopper,
       SDPBackend::flash_attention,
       SDPBackend::efficient_attention,
       SDPBackend::math,
@@ -199,6 +200,24 @@ bool check_sm_version(cudaDeviceProp * dprops) {
       (dprops->major == upper_bound::major &&
        dprops->minor <= upper_bound::minor);
   return is_gte_lower_bound && is_lte_upper_bound;
+}
+
+bool check_flash_attention_hopper_hardware_support(sdp_params const& params, bool debug) {
+  // Check that the gpu is capable of running flash attention hopper
+  using sm90 = SMVersion<9, 0>;
+  auto dprops = at::cuda::getCurrentDeviceProperties();
+  if (!check_sm_version<sm90>(dprops)) {
+    if (debug) {
+      TORCH_WARN(
+          "Flash attention hopper only supports sm90 gpu architecture. Attempting to run on a sm ",
+          dprops->major,
+          ".",
+          dprops->minor,
+          " gpu.");
+    }
+    return false;
+  }
+  return true;
 }
 
 bool check_flash_attention_hardware_support(sdp_params const& params, bool debug) {
@@ -592,6 +611,32 @@ bool is_flash_attention_available() {
 #endif
 }
 
+bool can_use_flash_attention_hopper(sdp_params const& params, bool debug) {
+#ifndef USE_FLASH_ATTENTION_HOPPER
+  if (debug) {
+    TORCH_WARN("Torch was not compiled with flash attention hopper.");
+  }
+  return false;
+#else // defined(USE_FLASH_ATTENTION_HOPPER)
+  constexpr auto general_constraints = array_of<bool (*)(sdp_params const&, bool)>(
+      check_runtime_disabled_flash,
+      check_all_tensors_on_device,
+      check_tensor_shapes,
+      check_for_attn_mask,
+      check_head_dim_size_flash,
+      check_flash_attention_hopper_hardware_support,
+      // check_requires_grad_and_head_dim_gt192_constraints_on_sm86_89,
+      check_flash_causal_non_square_seqlens,
+      check_dtypes_low_precision);
+  for (auto& constraint : general_constraints) {
+    if (!constraint(params, debug)) {
+      return false;
+    }
+  }
+  return true;
+#endif
+}
+
 bool can_use_flash_attention(sdp_params const& params, bool debug) {
 #ifndef USE_FLASH_ATTENTION
   if (debug) {
@@ -742,6 +787,11 @@ SDPBackend select_sdp_backend(sdp_params const& kernel_params) {
               return SDPBackend::cudnn_attention;
         }
         break;
+      case SDPBackend::flash_attention_hopper:
+        if (sdp::can_use_flash_attention_hopper(kernel_params, print_debug)) {
+          return SDPBackend::flash_attention_hopper;
+        }
+        break;
       case SDPBackend::flash_attention:
         if (sdp::can_use_flash_attention(kernel_params, print_debug)) {
           return SDPBackend::flash_attention;
@@ -773,6 +823,8 @@ SDPBackend select_sdp_backend(sdp_params const& kernel_params) {
   sdp::can_use_mem_efficient_attention(kernel_params, print_debug);
   TORCH_WARN("Flash attention kernel not used because:");
   sdp::can_use_flash_attention(kernel_params, print_debug);
+  TORCH_WARN("Flash attention hopper kernel not used because:");
+  sdp::can_use_flash_attention_hopper(kernel_params, print_debug);
   TORCH_WARN("CuDNN attention kernel not used because:");
   sdp::can_use_cudnn_attention(kernel_params, print_debug);
   TORCH_CHECK(!print_debug, "No available kernel. Aborting execution.")

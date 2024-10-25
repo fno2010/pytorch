@@ -2028,6 +2028,7 @@ Call this whenever a new thread is created in order to propagate values from
       .value("FLASH_ATTENTION", sdp::SDPBackend::flash_attention)
       .value("EFFICIENT_ATTENTION", sdp::SDPBackend::efficient_attention)
       .value("CUDNN_ATTENTION", sdp::SDPBackend::cudnn_attention)
+      .value("FLASH_ATTENTION_HOPPER", sdp::SDPBackend::flash_attention_hopper)
       .value("OVERRIDEABLE", sdp::SDPBackend::overrideable);
 
   py_module.def("_is_flash_attention_available", []() {

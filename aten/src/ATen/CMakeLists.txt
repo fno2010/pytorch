@@ -170,6 +170,11 @@ file(GLOB flash_attention_cuda_cpp "native/transformers/cuda/flash_attn/*.cpp")
 file(GLOB flash_attention_hip_hip "native/transformers/hip/flash_attn/*.hip")
 file(GLOB flash_attention_src_hip_hip "native/transformers/hip/flash_attn/src/*.hip")
 
+# flash_attention_hopper sources
+file(GLOB flash_attention_hopper_cuda_cu "native/transformers/cuda/flash_attn_hopper/*.cu")
+file(GLOB flash_attention_hopper_cuda_kernels_cu "native/transformers/cuda/flash_attn_hopper/kernels/*.cu")
+file(GLOB flash_attention_hopper_cuda_cpp "native/transformers/cuda/flash_attn_hopper/*.cpp")
+
 #Mem_eff attention sources
 file(GLOB mem_eff_attention_cuda_cu "native/transformers/cuda/mem_eff_attention/*.cu")
 file(GLOB mem_eff_attention_cuda_kernels_cu "native/transformers/cuda/mem_eff_attention/kernels/*.cu")
@@ -184,6 +189,14 @@ if(USE_FLASH_ATTENTION)
 
   list(APPEND native_transformers_hip_hip ${flash_attention_hip_hip})
   list(APPEND native_transformers_src_hip_hip ${flash_attention_src_hip_hip})
+endif()
+
+if(USE_FLASH_ATTENTION_HOPPER)
+  list(APPEND native_transformers_cuda_cu ${flash_attention_hopper_cuda_cu})
+  list(APPEND native_transformers_cuda_cu ${flash_attention_hopper_cuda_kernels_cu})
+  list(APPEND native_transformers_cuda_cpp ${flash_attention_hopper_cuda_cpp})
+  list(APPEND FLASH_ATTENTION_CUDA_SOURCES ${flash_attention_hopper_cuda_cu} ${flash_attention_hopper_cuda_kernels_cu})
+  list(APPEND ATen_ATTENTION_KERNEL_SRCS ${flash_attention_hopper_cuda_kernels_cu})
 endif()
 
 if(USE_MEM_EFF_ATTENTION)

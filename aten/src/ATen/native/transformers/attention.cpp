@@ -725,6 +725,18 @@ Tensor scaled_dot_product_attention(
           query_, key, value, attn_mask, compute_logsumexp, dropout_p, is_causal, false /*return_debug_mask*/, scale);
       return std::get<0>(out_lse_softmax);
     }
+    case sdp::SDPBackend::flash_attention_hopper: {
+      std::optional<Tensor> attn_mask = convert_boolean_attn_mask(attn_mask_, query_.dtype());
+      c10::SymInt og_size = query_.sym_size(-1);
+      Tensor query_padded = pad_last_dim<8, false>(query_);
+      Tensor key_padded = pad_last_dim<8, false>(key);
+      Tensor value_padded = pad_last_dim<8, false>(value);
+      // We need to calculate the scale based off the OG head dim size
+      auto og_scale = sdp::calculate_scale(query_, scale);
+      auto out_lse_softmax = at::_scaled_dot_product_flash_attention_hopper(
+          query_padded, key_padded, value_padded, dropout_p, is_causal, false /*return_debug_mask*/, og_scale.as_float_unchecked());
+      return post_process_flash_output(std::get<0>(out_lse_softmax), og_size);
+    }
     case sdp::SDPBackend::flash_attention: {
       std::optional<Tensor> attn_mask = convert_boolean_attn_mask(attn_mask_, query_.dtype());
       if(query_.device().type() == DeviceType::CUDA){

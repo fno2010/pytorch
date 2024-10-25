@@ -29,7 +29,8 @@ enum class SDPBackend {
   flash_attention = 1,
   efficient_attention = 2,
   cudnn_attention = 3,
-  overrideable = 4
+  flash_attention_hopper = 4,
+  overrideable = 5
 };
 
 // Note that if this changed make sure to update
